@@ -6,7 +6,7 @@
     <title>Decogarden — Piscinas, Jardines y Paisajismos</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.jsew"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         body {
@@ -1131,6 +1131,62 @@
         return n.toFixed(decimales).replace('.', ',');
     }
 
+    /**
+     * Limpia fechas largas como "Tue Nov 17 2026 07:22:00 GMT-0300 (hora estándar de Paraguay)"
+     * y las deja en formato claro "2026-11-17 07:22".
+     */
+    function formatearFechaHoraLimpia(val) {
+        if (!val) return '';
+        const str = String(val).trim();
+        if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+            return str.replace('T', ' ').slice(0, 16);
+        }
+        if (/GMT|Standard Time|hora est|[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}/i.test(str)) {
+            const d = new Date(str);
+            if (!isNaN(d.getTime())) {
+                const pad = n => String(n).padStart(2, '0');
+                return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            }
+        }
+        return str;
+    }
+
+    /**
+     * Fusiona los reportes descargados del servidor con las fotos locales en alta resolución
+     * para que nunca se pierdan las fotos al sincronizar.
+     */
+    function fusionarReportesConCacheLocal(remotos, locales) {
+        const mapLocal = {};
+        (locales || []).forEach(r => {
+            if (r && r.id) mapLocal[r.id] = r;
+        });
+        const resultado = (remotos || []).map(rem => {
+            const loc = mapLocal[rem.id];
+            const fechaLimpia = formatearFechaHoraLimpia(rem.fechaHora);
+            if (!loc) {
+                return { ...rem, fechaHora: fechaLimpia };
+            }
+            const tieneFotosLoc = Array.isArray(loc.fotos) && loc.fotos.length > 0;
+            const sectoresCombinados = (Array.isArray(loc.sectoresDetalle) && loc.sectoresDetalle.length > 0)
+                ? loc.sectoresDetalle
+                : (rem.sectoresDetalle || []);
+            return {
+                ...rem,
+                fechaHora: fechaLimpia,
+                fotos: tieneFotosLoc ? loc.fotos : (rem.fotos || []),
+                sectoresDetalle: sectoresCombinados
+            };
+        });
+        // Agregar reportes locales que aún no estén en la lista remota
+        const idsRemotos = new Set(resultado.map(r => r.id));
+        (locales || []).forEach(loc => {
+            if (loc && loc.id && !idsRemotos.has(loc.id)) {
+                resultado.unshift({ ...loc, fechaHora: formatearFechaHoraLimpia(loc.fechaHora) });
+            }
+        });
+        return resultado;
+    }
+
     let state = {
         gasUrl: BACKEND_API_URL,
         currentUser: null,
@@ -1297,79 +1353,123 @@
     }
 
     // =========================================================================
-    // COMPRESIÓN ULTRARRÁPIDA DE FOTOS + ESTAMPADO AUTOMÁTICO DE DATOS (m², SECTOR, CLIENTE)
+    // COMPRESIÓN ULTRARRÁPIDA DE FOTOS + ESTAMPADO PROPORCIONAL SIN DEFORMACIÓN
     // =========================================================================
+    function estamparDatosEnCanvasProporcional(imgSource, sectorName, secObjOverride = null, clienteOverride = null) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function () {
+                const maxDim = 1200; // Alta nitidez manteniendo proporción exacta 1:1
+                let width = img.naturalWidth || img.width || 900;
+                let height = img.naturalHeight || img.height || 900;
+
+                if (width > maxDim || height > maxDim) {
+                    const scale = maxDim / Math.max(width, height);
+                    width = Math.round(width * scale);
+                    height = Math.round(height * scale);
+                }
+
+                // 1. Canvas limpio (sin deformar, con proporción real para el PDF)
+                const cleanCanvas = document.createElement('canvas');
+                cleanCanvas.width = width;
+                cleanCanvas.height = height;
+                const cleanCtx = cleanCanvas.getContext('2d');
+                cleanCtx.drawImage(img, 0, 0, width, height);
+                const cleanDataUrl = cleanCanvas.toDataURL('image/jpeg', 0.84);
+
+                // 2. Canvas con sello proporcional en la parte inferior para galería / Drive
+                const stampedCanvas = document.createElement('canvas');
+                stampedCanvas.width = width;
+                stampedCanvas.height = height;
+                const ctx = stampedCanvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                const secObj = secObjOverride || state.sectorsData[sectorName] || { ancho: '', largo: '', area: 0, servicios: [], nota: '' };
+                const anchoNum = parseDecimalComa(secObj.ancho);
+                const largoNum = parseDecimalComa(secObj.largo);
+                const areaNum = secObj.area ? parseDecimalComa(secObj.area) : Number((anchoNum * largoNum).toFixed(2));
+                const areaTexto = areaNum > 0
+                    ? `${formatearDecimalComa(areaNum)} m² (${formatearDecimalComa(anchoNum, 1)}m × ${formatearDecimalComa(largoNum, 1)}m)`
+                    : 'Sin medidas especificadas';
+
+                const cliNom = clienteOverride || document.getElementById('cliente').value || 'Decogarden';
+                const fechaStr = new Date().toLocaleString('es-PY', { dateStyle: 'short', timeStyle: 'short' });
+                const srvsTexto = (secObj.servicios && secObj.servicios.length > 0)
+                    ? secObj.servicios.join(', ')
+                    : 'Inspección';
+                const notaTxt = (secObj.nota || '').trim();
+
+                const fontBase = Math.max(13, Math.min(22, Math.round(width * 0.026)));
+                const lineCount = notaTxt ? 4 : 3;
+                const bannerH = Math.round(fontBase * (lineCount * 1.35 + 0.8));
+                const yStart = height - bannerH;
+
+                const grad = ctx.createLinearGradient(0, yStart, 0, height);
+                grad.addColorStop(0, 'rgba(15, 23, 42, 0.84)');
+                grad.addColorStop(1, 'rgba(6, 78, 59, 0.94)');
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, yStart, width, bannerH);
+
+                ctx.fillStyle = '#10b981';
+                ctx.fillRect(0, yStart, width, 3);
+
+                const padX = Math.round(width * 0.03);
+                const maxTextW = width - padX * 2;
+                let currY = yStart + Math.round(fontBase * 1.35);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `bold ${fontBase + 1}px Inter, sans-serif`;
+                ctx.fillText(`DECOGARDEN • ${sectorName.toUpperCase()} — ${areaTexto}`, padX, currY, maxTextW);
+
+                currY += Math.round(fontBase * 1.32);
+                ctx.fillStyle = '#a7f3d0';
+                ctx.font = `600 ${fontBase - 1}px Inter, sans-serif`;
+                ctx.fillText(`Trabajos: ${srvsTexto}`, padX, currY, maxTextW);
+
+                if (notaTxt) {
+                    currY += Math.round(fontBase * 1.28);
+                    ctx.fillStyle = '#fde68a';
+                    ctx.font = `600 ${fontBase - 1}px Inter, sans-serif`;
+                    ctx.fillText(`Nota: ${notaTxt}`, padX, currY, maxTextW);
+                }
+
+                currY += Math.round(fontBase * 1.28);
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = `500 ${Math.max(11, fontBase - 2)}px Inter, sans-serif`;
+                ctx.fillText(`Cliente: ${cliNom}  |  ${fechaStr}`, padX, currY, maxTextW);
+
+                resolve({
+                    dataUrl: stampedCanvas.toDataURL('image/jpeg', 0.82),
+                    cleanDataUrl: cleanDataUrl,
+                    width: width,
+                    height: height,
+                    areaGrabada: areaNum,
+                    medidasTexto: areaTexto
+                });
+            };
+            img.onerror = () => resolve({
+                dataUrl: imgSource,
+                cleanDataUrl: imgSource,
+                width: 800,
+                height: 600,
+                areaGrabada: 0,
+                medidasTexto: ''
+            });
+            img.src = imgSource;
+        });
+    }
+
     function procesarYEstamparFotoSector(file, sectorName) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = function (event) {
-                const img = new Image();
-                img.onload = function () {
-                    const maxWidth = 900; // Tamaño ágil para subida veloz y excelente nitidez en PDF
-                    let width = img.width;
-                    let height = img.height;
-                    if (width > maxWidth) {
-                        height = Math.round((height * maxWidth) / width);
-                        width = maxWidth;
-                    }
-
-                    const canvas = document.createElement('canvas');
-                    canvas.width = width;
-                    canvas.height = height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, width, height);
-
-                    // Obtener los datos actuales del sector y del cliente para grabarlos en la foto
-                    const secObj = state.sectorsData[sectorName] || { ancho: '', largo: '', area: 0, servicios: [] };
-                    const anchoNum = parseDecimalComa(secObj.ancho);
-                    const largoNum = parseDecimalComa(secObj.largo);
-                    const areaNum = Number((anchoNum * largoNum).toFixed(2));
-                    const areaTexto = areaNum > 0
-                        ? `${formatearDecimalComa(areaNum)} m² (${formatearDecimalComa(anchoNum, 1)}m × ${formatearDecimalComa(largoNum, 1)}m)`
-                        : 'Sin medidas especificadas';
-
-                    const cliNom = document.getElementById('cliente').value || 'Decogarden';
-                    const fechaStr = new Date().toLocaleString('es-PY', { dateStyle: 'short', timeStyle: 'short' });
-                    const srvsTexto = (secObj.servicios && secObj.servicios.length > 0)
-                        ? secObj.servicios.slice(0, 3).join(', ')
-                        : 'Relevamiento técnico';
-
-                    // Dibujar franja inferior semitransparente con los datos grabados sobre la foto
-                    const bannerH = Math.max(76, Math.round(height * 0.16));
-                    const yStart = height - bannerH;
-                    const grad = ctx.createLinearGradient(0, yStart, 0, height);
-                    grad.addColorStop(0, 'rgba(15, 23, 42, 0.78)');
-                    grad.addColorStop(1, 'rgba(6, 78, 59, 0.92)');
-                    ctx.fillStyle = grad;
-                    ctx.fillRect(0, yStart, width, bannerH);
-
-                    // Línea superior verde Decogarden
-                    ctx.fillStyle = '#10b981';
-                    ctx.fillRect(0, yStart, width, 3);
-
-                    const fontBase = Math.max(13, Math.round(width * 0.022));
-                    const padX = Math.round(width * 0.025);
-
-                    ctx.fillStyle = '#ffffff';
-                    ctx.font = `bold ${fontBase + 2}px Inter, sans-serif`;
-                    ctx.fillText(`DECOGARDEN • ${sectorName.toUpperCase()} — ${areaTexto}`, padX, yStart + Math.round(bannerH * 0.34));
-
-                    ctx.fillStyle = '#a7f3d0';
-                    ctx.font = `600 ${fontBase}px Inter, sans-serif`;
-                    ctx.fillText(`Cliente: ${cliNom}  |  ${fechaStr}`, padX, yStart + Math.round(bannerH * 0.64));
-
-                    ctx.fillStyle = '#e2e8f0';
-                    ctx.font = `500 ${Math.max(11, fontBase - 1)}px Inter, sans-serif`;
-                    ctx.fillText(`Trabajos: ${srvsTexto}`, padX, yStart + Math.round(bannerH * 0.89));
-
-                    resolve({
-                        dataUrl: canvas.toDataURL('image/jpeg', 0.66),
-                        areaGrabada: areaNum,
-                        medidasTexto: areaTexto
-                    });
-                };
-                img.onerror = reject;
-                img.src = event.target.result;
+            reader.onload = async function (event) {
+                try {
+                    const res = await estamparDatosEnCanvasProporcional(event.target.result, sectorName);
+                    resolve(res);
+                } catch (e) {
+                    reject(e);
+                }
             };
             reader.onerror = reject;
             reader.readAsDataURL(file);
@@ -1377,7 +1477,7 @@
     }
 
     // =========================================================================
-    // GENERADOR DE REPORTE PDF PROFESIONAL CON EL LOGO DE DECOGARDEN Y FOTOS POR SECTOR
+    // GENERADOR DE REPORTE PDF PROFESIONAL CON EL LOGO DE DECOGARDEN Y FOTOS SIN DEFORMAR
     // =========================================================================
     async function obtenerLogoPngDataUrl() {
         return new Promise((resolve) => {
@@ -1398,20 +1498,55 @@
         });
     }
 
+    /**
+     * Obtiene las dimensiones reales (naturalWidth y naturalHeight) de cada foto
+     * para dibujarla en el PDF respetando 100% su proporción original (vertical, cuadrada u horizontal)
+     * sin ensancharla ni aplastarla jamás.
+     */
+    function obtenerDimensionesRealesFoto(src) {
+        return new Promise((resolve) => {
+            if (!src) return resolve(null);
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function () {
+                const w = img.naturalWidth || img.width || 800;
+                const h = img.naturalHeight || img.height || 600;
+                const c = document.createElement('canvas');
+                c.width = w;
+                c.height = h;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(img, 0, 0, w, h);
+                resolve({
+                    dataUrl: c.toDataURL('image/jpeg', 0.88),
+                    w: w,
+                    h: h,
+                    ratio: w / h
+                });
+            };
+            img.onerror = function () {
+                resolve({ dataUrl: src, w: 800, h: 600, ratio: 4 / 3 });
+            };
+            img.src = src;
+        });
+    }
+
     async function generarPDFReporteOficial(rep) {
         if (!window.jspdf || !window.jspdf.jsPDF) {
             mostrarToast('Error PDF', 'La librería PDF aún se está cargando.', 'error');
             return;
         }
 
-        mostrarToast('Generando PDF...', 'Armando reporte con logo de Decogarden y fotos por sector...', 'info');
+        mostrarToast('Generando PDF...', 'Armando reporte oficial con fotos en proporción exacta...', 'info');
 
         const { jsPDF } = window.jspdf;
         const doc = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
         const pageW = 210;
         const pageH = 297;
         const margin = 14;
+        const contentW = pageW - margin * 2; // 182 mm
         let y = 14;
+
+        const fechaLimpia = formatearFechaHoraLimpia(rep.fechaHora);
 
         // 1. Cabecera con Logo Oficial de Decogarden
         const logoData = await obtenerLogoPngDataUrl();
@@ -1426,7 +1561,7 @@
             doc.text('DECOGARDEN', margin, y + 8);
         }
 
-        // Título derecha
+        // Título derecha y badge de reporte
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(13);
         doc.setTextColor(15, 23, 42);
@@ -1435,65 +1570,83 @@
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(9);
         doc.setTextColor(71, 85, 105);
-        doc.text(`N° Reporte: ${rep.id}   |   Fecha: ${rep.fechaHora}`, pageW - margin, y + 12, { align: 'right' });
+        doc.text(`${rep.id} • ${rep.categoria || 'Fiscalización'}   |   Fecha: ${fechaLimpia}`, pageW - margin, y + 12, { align: 'right' });
 
-        y += 20;
+        y += 19;
         doc.setDrawColor(21, 128, 61);
         doc.setLineWidth(0.7);
         doc.line(margin, y, pageW - margin, y);
-        y += 6;
+        y += 5;
 
-        // 2. Caja de Datos del Cliente y Visita
-        doc.setFillColor(240, 253, 244);
-        doc.setDrawColor(187, 247, 208);
-        doc.roundedRect(margin, y, pageW - margin * 2, 28, 3, 3, 'FD');
+        // 2. Tarjeta Principal del Cliente y Resumen de Superficie (idéntica a la vista del modal)
+        doc.setFillColor(248, 250, 252);
+        doc.setDrawColor(226, 232, 240);
+        doc.roundedRect(margin, y, contentW, 27, 3.5, 3.5, 'FD');
 
         doc.setFont('helvetica', 'bold');
-        doc.setFontSize(11);
-        doc.setTextColor(20, 83, 45);
-        doc.text(`CLIENTE: ${rep.cliente} ${rep.codigoCliente ? '(Cód. ' + rep.codigoCliente + ')' : ''}`, margin + 4, y + 7);
+        doc.setFontSize(12);
+        doc.setTextColor(15, 23, 42);
+        doc.text(`${rep.cliente || 'CLIENTE'}${rep.codigoCliente ? ' (Cód. ' + rep.codigoCliente + ')' : ''}`, margin + 4.5, y + 7.5);
 
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(9);
-        doc.setTextColor(51, 65, 85);
-        doc.text(`Dirección / Barrio: ${rep.barrio || ''} - ${rep.direccion || 'Registrada en sistema'} (Zona ${rep.zonaRuteo || '-'})`, margin + 4, y + 13);
-        doc.text(`Modalidad: ${rep.categoria}   |   Superficie Total Relevada: ${formatearDecimalComa(rep.areaTotal || 0)} m²`, margin + 4, y + 19);
-        doc.text(`Ejecutivo / Fiscalizador: ${rep.nombreInspector}   |   Nivel de Urgencia: ${rep.urgencia}`, margin + 4, y + 25);
+        doc.setTextColor(100, 116, 139);
+        const dirPartes = [rep.barrio, rep.direccion].filter(x => x && String(x).trim() !== '' && String(x).trim() !== '-');
+        const dirTexto = dirPartes.length > 0 ? dirPartes.join(' • ') : '';
+        const zonaTxt = (rep.zonaRuteo && String(rep.zonaRuteo).trim() !== '' && String(rep.zonaRuteo).trim() !== '-') ? `Zona ${rep.zonaRuteo}` : '';
+        const lineaMeta = [fechaLimpia, rep.nombreInspector, dirTexto, zonaTxt].filter(Boolean).join('  •  ');
+        doc.text(lineaMeta, margin + 4.5, y + 13.5);
 
-        y += 34;
+        // Sub-bloque con Sectores y Superficie Total (como en el modal)
+        doc.setDrawColor(226, 232, 240);
+        doc.line(margin + 4.5, y + 16.5, pageW - margin - 4.5, y + 16.5);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8.5);
+        doc.setTextColor(100, 116, 139);
+        doc.text('Sectores:', margin + 4.5, y + 22.5);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9.5);
+        doc.setTextColor(15, 23, 42);
+        doc.text(`${rep.zona || 'Entrada'}`, margin + 21, y + 22.5);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8.5);
+        doc.setTextColor(100, 116, 139);
+        doc.text('Superficie Total:', margin + 96, y + 22.5);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(10);
+        doc.setTextColor(6, 95, 70);
+        doc.text(`${formatearDecimalComa(rep.areaTotal || 0)} m²`, margin + 123, y + 22.5);
+
+        y += 32;
 
         // 3. Parámetros de Piscina (si aplica)
         if (rep.phPiscina || rep.cloroPpm || (rep.insumos && rep.insumos.length > 0)) {
             doc.setFillColor(240, 249, 255);
             doc.setDrawColor(186, 230, 253);
-            doc.roundedRect(margin, y, pageW - margin * 2, 22, 3, 3, 'FD');
+            doc.roundedRect(margin, y, contentW, 21, 3.5, 3.5, 'FD');
 
             doc.setFont('helvetica', 'bold');
-            doc.setFontSize(10);
+            doc.setFontSize(9.5);
             doc.setTextColor(3, 105, 161);
-            doc.text('PARÁMETROS TÉCNICOS DE PISCINA', margin + 4, y + 6.5);
+            doc.text('PISCINA — PARÁMETROS Y TAREAS REALIZADAS', margin + 4.5, y + 6.5);
 
             doc.setFont('helvetica', 'normal');
-            doc.setFontSize(9);
+            doc.setFontSize(8.8);
             doc.setTextColor(30, 41, 59);
-            doc.text(`Aspecto del Agua: ${rep.aspectoAgua || 'Cristalina'}   |   pH: ${rep.phPiscina || '-'}   |   Cloro: ${rep.cloroPpm || '-'} ppm   |   Alcalinidad: ${rep.alcalinidadPpm || '-'} ppm`, margin + 4, y + 12.5);
+            doc.text(`Agua: ${rep.aspectoAgua || 'Cristalina'}   |   pH: ${rep.phPiscina || '-'}   |   Cloro: ${rep.cloroPpm || '-'} ppm   |   Alcalinidad: ${rep.alcalinidadPpm || '-'} ppm`, margin + 4.5, y + 12.2);
             const insTxt = (rep.insumos && rep.insumos.length) ? rep.insumos.join(', ') : 'Control general';
-            const splitIns = doc.splitTextToSize(`Tareas / Insumos aplicados: ${insTxt}`, pageW - margin * 2 - 8);
-            doc.text(splitIns[0] || '', margin + 4, y + 18.5);
-            y += 28;
+            const splitIns = doc.splitTextToSize(`Insumos / Tareas: ${insTxt}`, contentW - 9);
+            doc.text(splitIns[0] || '', margin + 4.5, y + 17.8);
+            y += 26;
         }
 
-        // 4. Desglose Detallado por cada Sector Trabajado + Sus Fotos Asociadas
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(11);
-        doc.setTextColor(15, 23, 42);
-        doc.text('DESGLOSE POR SECTOR TRABAJADO Y EVIDENCIA FOTOGRÁFICA', margin, y);
-        y += 5;
-
+        // 4. Tarjetas de cada Sector (Diseño unificado verde esmeralda igual al modal: Sector, m², Trabajos, Nota y Fotos proporcionales adentro)
         const sectores = (Array.isArray(rep.sectoresDetalle) && rep.sectoresDetalle.length > 0)
             ? rep.sectoresDetalle
             : [{
-                sector: rep.zona || 'Sector General',
+                sector: rep.zona || 'Entrada',
                 ancho: rep.ancho || 0,
                 largo: rep.largo || 0,
                 area: rep.areaTotal || 0,
@@ -1503,110 +1656,188 @@
             }];
 
         for (const sec of sectores) {
-            if (y > pageH - 45) {
+            // Obtener las fotos con sello pertenecientes a este sector
+            let fotosSources = [];
+            if (Array.isArray(rep.fotos) && rep.fotos.length > 0) {
+                const delSec = rep.fotos.filter(f => (f.sector || f.etiqueta) === sec.sector);
+                if (delSec.length > 0) {
+                    fotosSources = delSec.map(f => f.dataUrl).filter(Boolean);
+                }
+            }
+            if (fotosSources.length === 0 && Array.isArray(sec.fotos)) {
+                fotosSources = sec.fotos.map(f => (typeof f === 'string' ? f : f.dataUrl)).filter(Boolean);
+            }
+
+            // Cargar dimensiones reales (naturalWidth / naturalHeight) de todas las fotos del sector
+            const fotosCargadas = [];
+            for (const src of fotosSources) {
+                const info = await obtenerDimensionesRealesFoto(src);
+                if (info) fotosCargadas.push(info);
+            }
+
+            // Preparar textos explicativos del sector (Trabajos y Nota) igual que en la ventana del reporte
+            const srvsTexto = (sec.servicios && sec.servicios.length) ? sec.servicios.join(', ') : 'Inspección';
+            const notaTexto = (sec.nota || '').trim();
+
+            doc.setFont('helvetica', 'normal');
+            doc.setFontSize(9.2);
+            const srvsLines = doc.splitTextToSize(srvsTexto, contentW - 26);
+            const nLines = notaTexto ? doc.splitTextToSize(notaTexto, contentW - 20) : [];
+
+            const headerTextH = 10 + (srvsLines.length * 4.5) + (nLines.length > 0 ? (nLines.length * 4.5 + 1.5) : 0) + 3;
+
+            // Calcular filas de fotos (2 columnas por fila) manteniendo 100% su relación de aspecto real sin estirar
+            const slotW = (contentW - 14) / 2; // 84 mm máximo por columna
+            const maxPhotoH = 96; // Hasta 96 mm de altura para que las fotos verticales se vean amplias y nítidas
+            const filasFotos = [];
+
+            for (let i = 0; i < fotosCargadas.length; i += 2) {
+                const f1 = fotosCargadas[i];
+                const f2 = fotosCargadas[i + 1] || null;
+
+                // Tamaño proporcional exacto de f1 (drawW / drawH === f1.ratio)
+                let w1 = slotW;
+                let h1 = w1 / f1.ratio;
+                if (h1 > maxPhotoH) {
+                    h1 = maxPhotoH;
+                    w1 = h1 * f1.ratio;
+                }
+
+                let w2 = 0, h2 = 0;
+                if (f2) {
+                    w2 = slotW;
+                    h2 = w2 / f2.ratio;
+                    if (h2 > maxPhotoH) {
+                        h2 = maxPhotoH;
+                        w2 = h2 * f2.ratio;
+                    }
+                }
+
+                const rowH = Math.max(h1, h2);
+                filasFotos.push({ f1, w1, h1, f2, w2, h2, rowH });
+            }
+
+            const primeraFilaH = filasFotos.length > 0 ? (filasFotos[0].rowH + 6) : 0;
+            if (y + headerTextH + primeraFilaH > pageH - 18) {
                 doc.addPage();
                 y = 16;
             }
 
-            // Encabezado del Sector
-            doc.setFillColor(248, 250, 252);
-            doc.setDrawColor(203, 213, 225);
-            doc.roundedRect(margin, y, pageW - margin * 2, 22, 2.5, 2.5, 'FD');
+            const totalFotosH = filasFotos.reduce((acc, r) => acc + r.rowH + 5, 0);
+            const cabeCompletoEnPagina = (y + headerTextH + totalFotosH + 3 <= pageH - 16);
+            const boxTotalH = cabeCompletoEnPagina ? (headerTextH + totalFotosH + (filasFotos.length > 0 ? 3 : 1)) : headerTextH;
 
+            // Tarjeta verde esmeralda suave envolviendo tanto la explicación como las fotos (igual al modal)
+            doc.setFillColor(236, 253, 245); // #ecfdf5
+            doc.setDrawColor(167, 243, 208); // #a7f3d0
+            doc.setLineWidth(0.5);
+            doc.roundedRect(margin, y, contentW, boxTotalH, 3.5, 3.5, 'FD');
+
+            // Encabezado del sector: izquierda Nombre del Sector, derecha m² (ancho × largo)
+            const medStr = `${formatearDecimalComa(sec.area || 0)} m² (${formatearDecimalComa(sec.ancho || 0, 1)}×${formatearDecimalComa(sec.largo || 0, 1)}m)`;
             doc.setFont('helvetica', 'bold');
-            doc.setFontSize(10);
-            doc.setTextColor(21, 128, 61);
-            const medStr = `${formatearDecimalComa(sec.area || 0)} m² (${formatearDecimalComa(sec.ancho || 0, 1)} m × ${formatearDecimalComa(sec.largo || 0, 1)} m)`;
-            doc.text(`SECTOR: ${String(sec.sector || '').toUpperCase()}`, margin + 3.5, y + 6.5);
-            doc.text(`Superficie: ${medStr}`, pageW - margin - 3.5, y + 6.5, { align: 'right' });
+            doc.setFontSize(10.5);
+            doc.setTextColor(6, 78, 59); // #064e3b
+            doc.text(`${sec.sector || 'Sector'}`, margin + 4.5, y + 7);
+            doc.text(medStr, pageW - margin - 4.5, y + 7, { align: 'right' });
 
+            let textY = y + 12.8;
+
+            // Línea "Trabajos: ..."
+            doc.setFont('helvetica', 'bold');
+            doc.setFontSize(9.2);
+            doc.setTextColor(30, 41, 59);
+            doc.text('Trabajos:', margin + 4.5, textY);
             doc.setFont('helvetica', 'normal');
-            doc.setFontSize(8.8);
-            doc.setTextColor(51, 65, 85);
-            const srvs = (sec.servicios && sec.servicios.length) ? sec.servicios.join(', ') : 'Inspección y mantenimiento';
-            const lineSrv = doc.splitTextToSize(`Servicios / Trabajos: ${srvs}`, pageW - margin * 2 - 7);
-            doc.text(lineSrv[0] || '', margin + 3.5, y + 12.5);
+            doc.text(srvsLines, margin + 21, textY);
+            textY += srvsLines.length * 4.5 + 1;
 
-            if (sec.nota) {
-                const lineNota = doc.splitTextToSize(`Detalle del sector: ${sec.nota}`, pageW - margin * 2 - 7);
-                doc.text(lineNota[0] || '', margin + 3.5, y + 18);
-            } else {
-                doc.text('Detalle del sector: Relevamiento conforme.', margin + 3.5, y + 18);
+            // Línea "Nota: ..." (si el operador escribió una nota en el sector, ej. "Quiere planta")
+            if (notaTexto) {
+                doc.setFont('helvetica', 'bold');
+                doc.setFontSize(9.2);
+                doc.setTextColor(51, 65, 85);
+                doc.text('Nota:', margin + 4.5, textY);
+                doc.setFont('helvetica', 'normal');
+                doc.text(nLines, margin + 15, textY);
+                textY += nLines.length * 4.5 + 1;
             }
 
-            y += 25;
+            let cursorY = y + headerTextH + 1;
 
-            // Fotos pertenecientes específicamente a este sector
-            let fotosDelSector = Array.isArray(sec.fotos) ? sec.fotos : [];
-            if (fotosDelSector.length === 0 && Array.isArray(rep.fotos)) {
-                fotosDelSector = rep.fotos
-                    .filter(f => (f.sector || f.etiqueta) === sec.sector)
-                    .map(f => f.dataUrl);
-            }
-
-            if (fotosDelSector.length > 0) {
-                const imgW = 86;
-                const imgH = 58;
-                for (let i = 0; i < fotosDelSector.length; i += 2) {
-                    if (y + imgH + 8 > pageH - 15) {
-                        doc.addPage();
-                        y = 16;
-                    }
-                    try {
-                        doc.addImage(fotosDelSector[i], 'JPEG', margin, y, imgW, imgH);
-                        doc.setDrawColor(203, 213, 225);
-                        doc.rect(margin, y, imgW, imgH);
-                    } catch (e) {}
-
-                    if (fotosDelSector[i + 1]) {
-                        try {
-                            const xRight = pageW - margin - imgW;
-                            doc.addImage(fotosDelSector[i + 1], 'JPEG', xRight, y, imgW, imgH);
-                            doc.setDrawColor(203, 213, 225);
-                            doc.rect(xRight, y, imgW, imgH);
-                        } catch (e) {}
-                    }
-                    y += imgH + 5;
+            // Dibujar cada foto respetando 100% su relación de aspecto real con marco ajustado
+            for (let rIdx = 0; rIdx < filasFotos.length; rIdx++) {
+                const fila = filasFotos[rIdx];
+                if (!cabeCompletoEnPagina && (cursorY + fila.rowH + 4 > pageH - 16)) {
+                    doc.addPage();
+                    cursorY = 16;
                 }
+
+                const cols = [
+                    { info: fila.f1, drawW: fila.w1, drawH: fila.h1, slotX: margin + 4.5 },
+                    { info: fila.f2, drawW: fila.w2, drawH: fila.h2, slotX: margin + 4.5 + slotW + 5 }
+                ];
+
+                for (const col of cols) {
+                    if (!col.info) continue;
+
+                    // Centrar la foto dentro de su columna manteniendo su proporción exacta
+                    const imgX = col.slotX + (slotW - col.drawW) / 2;
+                    const imgY = cursorY + (fila.rowH - col.drawH) / 2;
+
+                    // Marco blanco alrededor de las dimensiones reales de la foto
+                    doc.setFillColor(255, 255, 255);
+                    doc.setDrawColor(167, 243, 208);
+                    doc.setLineWidth(0.5);
+                    doc.roundedRect(imgX - 1.2, imgY - 1.2, col.drawW + 2.4, col.drawH + 2.4, 2, 2, 'FD');
+
+                    try {
+                        doc.addImage(col.info.dataUrl, 'JPEG', imgX, imgY, col.drawW, col.drawH);
+                    } catch (e) {}
+                }
+
+                cursorY += fila.rowH + 5;
             }
+
+            y = cabeCompletoEnPagina ? (y + boxTotalH + 5) : (cursorY + 3);
         }
 
-        // 5. Observaciones Generales y Alertas
-        if (y > pageH - 40) {
+        // 5. Observaciones Generales y Alertas (igual que en el modal)
+        if (y > pageH - 36) {
             doc.addPage();
             y = 16;
         }
 
-        doc.setFillColor(255, 255, 255);
-        doc.setDrawColor(203, 213, 225);
-        const obsTexto = rep.observaciones || 'Sin observaciones adicionales.';
-        const obsLines = doc.splitTextToSize(obsTexto, pageW - margin * 2 - 8);
-        const boxH = Math.max(20, obsLines.length * 5 + 12);
-        doc.roundedRect(margin, y, pageW - margin * 2, boxH, 2.5, 2.5, 'FD');
+        doc.setFillColor(248, 250, 252);
+        doc.setDrawColor(226, 232, 240);
+        const obsTexto = rep.observaciones || 'Sin observaciones.';
+        const obsLines = doc.splitTextToSize(obsTexto, contentW - 9);
+        const boxH = Math.max(18, obsLines.length * 4.5 + 11);
+        doc.roundedRect(margin, y, contentW, boxH, 3.5, 3.5, 'FD');
 
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(9.5);
         doc.setTextColor(15, 23, 42);
-        doc.text('OBSERVACIONES GENERALES Y RECOMENDACIONES:', margin + 4, y + 6.5);
+        doc.text('Observaciones:', margin + 4.5, y + 6.5);
 
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(9);
         doc.setTextColor(51, 65, 85);
-        doc.text(obsLines, margin + 4, y + 12.5);
-        y += boxH + 6;
+        doc.text(obsLines, margin + 4.5, y + 12);
+        y += boxH + 5;
 
         if (rep.alertaActiva && rep.detalleAlerta) {
-            if (y > pageH - 25) {
+            if (y > pageH - 24) {
                 doc.addPage();
                 y = 16;
             }
             doc.setFillColor(254, 242, 242);
             doc.setDrawColor(252, 165, 165);
-            doc.roundedRect(margin, y, pageW - margin * 2, 16, 2.5, 2.5, 'FD');
+            doc.roundedRect(margin, y, contentW, 15, 3, 3, 'FD');
             doc.setFont('helvetica', 'bold');
             doc.setFontSize(9);
             doc.setTextColor(185, 28, 28);
-            doc.text(`ALERTA TÉCNICA (${rep.urgencia}): ${rep.detalleAlerta} (Seguimiento: ${rep.fechaSeguimiento || 'Inmediato'})`, margin + 4, y + 10);
+            doc.text(`ALERTA TÉCNICA (${rep.urgencia}): ${rep.detalleAlerta} (Seguimiento: ${formatearFechaHoraLimpia(rep.fechaSeguimiento) || 'Inmediato'})`, margin + 4.5, y + 9.5);
         }
 
         // Pie de página en todas las hojas
@@ -1626,7 +1857,7 @@
 
         const safeClient = String(rep.cliente || 'Cliente').replace(/[^\w\s-]/gi, '').trim().replace(/\s+/g, '_');
         doc.save(`Reporte_Decogarden_${safeClient}_${rep.id}.pdf`);
-        mostrarToast('¡PDF Descargado!', 'El reporte oficial en PDF con logo y fotos ya está en tu dispositivo.', 'success');
+        mostrarToast('¡PDF Descargado!', 'El reporte oficial en PDF con fotos proporcionales ya está listo.', 'success');
     }
 
     // =========================================================================
@@ -1671,8 +1902,9 @@
                         safeSetStorage(STORAGE_KEYS.OPERATORS, state.operators);
                     } else {
                         const opClean = state.currentUser.usuario;
+                        const prevRepLocales = leerReportesLocalesDeOperador(opClean);
                         state.clients = filtrarEstrictamentePorOperador(data.clientes || [], opClean);
-                        state.reports = filtrarEstrictamentePorOperador(data.reportes || [], opClean);
+                        state.reports = fusionarReportesConCacheLocal(filtrarEstrictamentePorOperador(data.reportes || [], opClean), prevRepLocales);
                         state.alerts = filtrarEstrictamentePorOperador(data.alertas || [], opClean);
                         guardarCarteraLocalDeOperador(opClean, state.clients);
                         guardarReportesLocalesDeOperador(opClean, state.reports);
@@ -1930,7 +2162,7 @@
                     <div class="min-w-0">
                         <span class="text-[10px] font-extrabold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">${r.id}</span>
                         <h4 class="text-xs sm:text-sm font-extrabold text-slate-900 truncate mt-0.5">${r.cliente}</h4>
-                        <p class="text-[11px] text-slate-500 truncate">${r.zona} • ${formatearDecimalComa(r.areaTotal || 0)} m² • ${r.fechaHora}</p>
+                        <p class="text-[11px] text-slate-500 truncate">${r.zona} • ${formatearDecimalComa(r.areaTotal || 0)} m² • ${formatearFechaHoraLimpia(r.fechaHora)}</p>
                     </div>
                     <div class="flex items-center gap-1.5 shrink-0">
                         <button type="button" data-home-pdf="${r.id}" class="btn-home-pdf px-2.5 py-2 rounded-xl bg-emerald-600 text-white text-[11px] font-extrabold">
@@ -2167,6 +2399,9 @@
                             sector: sName,
                             etiqueta: sName,
                             dataUrl: res.dataUrl,
+                            cleanDataUrl: res.cleanDataUrl || res.dataUrl,
+                            width: res.width || 800,
+                            height: res.height || 600,
                             medidasTexto: res.medidasTexto
                         });
                     } catch (err) {
@@ -3002,21 +3237,39 @@
         const areaTotal = recalcularSuperficieTotalSectores();
 
         const todasLasFotos = [];
-        const sectoresDetalle = nombresSectoresActivos.map(secName => {
+        const sectoresDetalle = [];
+        for (const secName of nombresSectoresActivos) {
             const s = state.sectorsData[secName];
             const fotosDelSec = Array.isArray(s.fotos) ? s.fotos : [];
-            fotosDelSec.forEach(f => todasLasFotos.push(f));
+            const fotosActualizadas = [];
 
-            return {
+            for (const f of fotosDelSec) {
+                const baseImg = f.cleanDataUrl || f.dataUrl;
+                const reestampada = await estamparDatosEnCanvasProporcional(baseImg, secName, s, clienteNombre);
+                const fotoFinal = {
+                    ...f,
+                    sector: secName,
+                    etiqueta: secName,
+                    dataUrl: reestampada.dataUrl,
+                    cleanDataUrl: reestampada.cleanDataUrl || baseImg,
+                    width: reestampada.width,
+                    height: reestampada.height,
+                    medidasTexto: reestampada.medidasTexto
+                };
+                todasLasFotos.push(fotoFinal);
+                fotosActualizadas.push(fotoFinal.dataUrl);
+            }
+
+            sectoresDetalle.push({
                 sector: secName,
                 ancho: parseDecimalComa(s.ancho),
                 largo: parseDecimalComa(s.largo),
                 area: s.area || 0,
                 servicios: [...s.servicios],
                 nota: (s.nota || '').trim(),
-                fotos: fotosDelSec.map(f => f.dataUrl)
-            };
-        });
+                fotos: fotosActualizadas
+            });
+        }
 
         const resumenSectoresServicios = sectoresDetalle.map(sd => {
             const srvs = sd.servicios.length ? sd.servicios.join(', ') : 'Inspección general';
@@ -3222,7 +3475,7 @@
                             <div class="flex items-center gap-1.5">
                                 <span class="text-[10px] font-extrabold px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">${rep.id}</span>
                                 <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600">${rep.categoria}</span>
-                                <span class="text-[10px] text-slate-400">${rep.fechaHora}</span>
+                                <span class="text-[10px] text-slate-400">${formatearFechaHoraLimpia(rep.fechaHora)}</span>
                             </div>
                             <h3 class="text-base font-extrabold text-slate-900 mt-1">[#${rep.codigoCliente || '-'}] ${rep.cliente}</h3>
                             <p class="text-xs font-semibold text-emerald-800">Superficie Total Trabajada: ${formatearDecimalComa(rep.areaTotal || 0)} m²</p>
@@ -3272,7 +3525,7 @@
 
         document.getElementById('detail-modal-id').textContent = `${rep.id} • ${rep.categoria}`;
         document.getElementById('detail-modal-client').textContent = rep.cliente;
-        document.getElementById('detail-modal-meta').textContent = `${rep.fechaHora} • ${rep.nombreInspector}`;
+        document.getElementById('detail-modal-meta').textContent = `${formatearFechaHoraLimpia(rep.fechaHora)} • ${rep.nombreInspector}`;
 
         const sectores = (Array.isArray(rep.sectoresDetalle) && rep.sectoresDetalle.length > 0)
             ? rep.sectoresDetalle
@@ -3692,4 +3945,4 @@
     });
 </script>
 </body>
-</html>
+</html>```
